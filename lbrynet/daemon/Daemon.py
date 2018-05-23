@@ -3106,6 +3106,7 @@ class Daemon(AuthJSONRPCServer):
                     <bucket index>: [
                         {
                             "address": (str) peer address,
+                            "port": (int) peer udp port
                             "node_id": (str) peer node id,
                             "blobs": (list) blob hashes announced by peer
                         }
@@ -3128,7 +3129,7 @@ class Daemon(AuthJSONRPCServer):
                     try:
                         contact = self.session.dht_node._routingTable.getContact(
                             originalPublisherID)
-                    except ValueError:
+                    except (ValueError, IndexError):
                         continue
                     if contact in hosts:
                         blobs = hosts[contact]
@@ -3151,6 +3152,7 @@ class Daemon(AuthJSONRPCServer):
                     blobs = []
                 host = {
                     "address": contact.address,
+                    "port": contact.port,
                     "node_id": contact.id.encode("hex"),
                     "blobs": blobs,
                 }
