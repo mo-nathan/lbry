@@ -28,15 +28,13 @@ from lbrynet.reflector import reupload
 from lbrynet.reflector import ServerFactory as reflector_server_factory
 from lbrynet.core.log_support import configure_loggly_handler
 from lbrynet.lbry_file.client.EncryptedFileDownloader import EncryptedFileSaverFactory
-from lbrynet.lbry_file.client.EncryptedFileOptions import add_lbry_file_to_sd_identifier
-from lbrynet.file_manager.EncryptedFileManager import EncryptedFileManager
 from lbrynet.daemon.Downloader import GetStream
 from lbrynet.daemon.Publisher import Publisher
 from lbrynet.daemon.ExchangeRateManager import ExchangeRateManager
 from lbrynet.daemon.auth.server import AuthJSONRPCServer
 from lbrynet.core.PaymentRateManager import OnlyFreePaymentsManager
 from lbrynet.core import utils, system_info
-from lbrynet.core.StreamDescriptor import StreamDescriptorIdentifier, download_sd_blob
+from lbrynet.core.StreamDescriptor import download_sd_blob
 from lbrynet.core.StreamDescriptor import EncryptedFileStreamType
 from lbrynet.core.looping_call_manager import LoopingCallManager
 from lbrynet.core.server.BlobRequestHandler import BlobRequestHandlerFactory
@@ -216,8 +214,8 @@ class Daemon(AuthJSONRPCServer):
             Checker.CONNECTION_STATUS: LoopingCall(self._update_connection_status),
         }
         self.looping_call_manager = LoopingCallManager(calls)
-        self.sd_identifier = StreamDescriptorIdentifier()
-        self.lbry_file_manager = None
+        self.sd_identifier = None
+        self.file_manager = None
         # self.storage = None
         self.wallet = None
 
@@ -234,31 +232,20 @@ class Daemon(AuthJSONRPCServer):
 
         yield self._initial_setup()
         yield self.component_manager.setup()
-        # self.storage = self.component_manager.get_component("database").storage
         self.wallet = self.component_manager.get_component("wallet").wallet
         self.startup_status = STARTUP_STAGES[2]
         self.session = self.component_manager.get_component("session").session
         yield self._check_wallet_locked()
         yield self._start_analytics()
-        yield add_lbry_file_to_sd_identifier(self.sd_identifier)
-        yield self._setup_stream_identifier()
-        yield self._setup_lbry_file_manager()
+        self.sd_identifier = self.component_manager.get_component("streamIdentifier").sd_identifier
+        self.startup_status = STARTUP_STAGES[3]
+        self.file_manager = self.component_manager.get_component("fileManager").file_manager
         yield self._setup_query_handlers()
         yield self._setup_server()
         log.info("Starting balance: " + str(self.session.wallet.get_balance()))
         self.announced_startup = True
         self.startup_status = STARTUP_STAGES[5]
         log.info("Started lbrynet-daemon")
-
-        # ###
-        # # this should be removed with the next db revision
-        # if migrated:
-        #     missing_channel_claim_ids = yield self.storage.get_unknown_certificate_ids()
-        #     while missing_channel_claim_ids:  # in case there are a crazy amount lets batch to be safe
-        #         batch = missing_channel_claim_ids[:100]
-        #         _ = yield self.session.wallet.get_claims_by_ids(*batch)
-        #         missing_channel_claim_ids = missing_channel_claim_ids[100:]
-        # ###
 
         self._auto_renew()
 
@@ -328,7 +315,7 @@ class Daemon(AuthJSONRPCServer):
                 reflector_factory = reflector_server_factory(
                     self.session.peer_manager,
                     self.session.blob_manager,
-                    self.lbry_file_manager
+                    self.file_manager
                 )
                 try:
                     self.reflector_server_port = reactor.listenTCP(self.reflector_port,
@@ -349,11 +336,6 @@ class Daemon(AuthJSONRPCServer):
                     return defer.maybeDeferred(p.stopListening)
             except AttributeError:
                 return defer.succeed(True)
-        return defer.succeed(True)
-
-    def _stop_file_manager(self):
-        if self.lbry_file_manager:
-            self.lbry_file_manager.stop()
         return defer.succeed(True)
 
     def _stop_server(self):
@@ -417,8 +399,6 @@ class Daemon(AuthJSONRPCServer):
         d.addErrback(log.fail(), 'Failure while shutting down')
         d.addCallback(lambda _: self._stop_reflector())
         d.addErrback(log.fail(), 'Failure while shutting down')
-        d.addCallback(lambda _: self._stop_file_manager())
-        d.addErrback(log.fail(), 'Failure while shutting down')
         if self.session is not None:
             d.addCallback(lambda _: self.component_manager.stop())
             d.addCallback(lambda _: self.session.shut_down())
@@ -465,14 +445,6 @@ class Daemon(AuthJSONRPCServer):
         self.download_timeout = conf.settings['download_timeout']
 
         return defer.succeed(True)
-
-    @defer.inlineCallbacks
-    def _setup_lbry_file_manager(self):
-        log.info('Starting the file manager')
-        self.startup_status = STARTUP_STAGES[3]
-        self.lbry_file_manager = EncryptedFileManager(self.session, self.sd_identifier)
-        yield self.lbry_file_manager.setup()
-        log.info('Done setting up file manager')
 
     def _start_analytics(self):
         if not self.analytics_manager.is_started:
@@ -629,7 +601,7 @@ class Daemon(AuthJSONRPCServer):
     def _publish_stream(self, name, bid, claim_dict, file_path=None, certificate_id=None,
                         claim_address=None, change_address=None):
 
-        publisher = Publisher(self.session, self.lbry_file_manager, self.session.wallet,
+        publisher = Publisher(self.session, self.file_manager, self.session.wallet,
                               certificate_id)
         parse_lbry_uri(name)
         if not file_path:
@@ -841,7 +813,7 @@ class Daemon(AuthJSONRPCServer):
     def _get_lbry_file(self, search_by, val, return_json=False, full_status=False):
         lbry_file = None
         if search_by in FileID:
-            for l_f in self.lbry_file_manager.lbry_files:
+            for l_f in self.file_manager.lbry_files:
                 if l_f.__dict__.get(search_by) == val:
                     lbry_file = l_f
                     break
@@ -853,7 +825,7 @@ class Daemon(AuthJSONRPCServer):
 
     @defer.inlineCallbacks
     def _get_lbry_files(self, return_json=False, full_status=True, **kwargs):
-        lbry_files = list(self.lbry_file_manager.lbry_files)
+        lbry_files = list(self.file_manager.lbry_files)
         if kwargs:
             for search_type, value in iter_lbry_file_search_values(kwargs):
                 lbry_files = [l_f for l_f in lbry_files if l_f.__dict__[search_type] == value]
@@ -1000,7 +972,7 @@ class Daemon(AuthJSONRPCServer):
             should_announce_blobs = yield self.session.blob_manager.count_should_announce_blobs()
             response['session_status'] = {
                 'managed_blobs': len(blobs),
-                'managed_streams': len(self.lbry_file_manager.lbry_files),
+                'managed_streams': len(self.file_manager.lbry_files),
                 'announce_queue_size': announce_queue_size,
                 'should_announce_blobs': should_announce_blobs,
             }
@@ -1627,7 +1599,7 @@ class Daemon(AuthJSONRPCServer):
             raise Exception('Unable to find a file for {}:{}'.format(search_type, value))
 
         if status == 'start' and lbry_file.stopped or status == 'stop' and not lbry_file.stopped:
-            yield self.lbry_file_manager.toggle_lbry_file_running(lbry_file)
+            yield self.file_manager.toggle_lbry_file_running(lbry_file)
             msg = "Started downloading file" if status == 'start' else "Stopped downloading file"
         else:
             msg = (
@@ -1689,8 +1661,8 @@ class Daemon(AuthJSONRPCServer):
                 file_name, stream_hash = lbry_file.file_name, lbry_file.stream_hash
                 if lbry_file.sd_hash in self.streams:
                     del self.streams[lbry_file.sd_hash]
-                yield self.lbry_file_manager.delete_lbry_file(lbry_file,
-                                                              delete_file=delete_from_download_dir)
+                yield self.file_manager.delete_lbry_file(lbry_file,
+                                                         delete_file=delete_from_download_dir)
                 log.info("Deleted file: %s", file_name)
             result = True
 
